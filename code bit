@@ -1,0 +1,85 @@
+contract-scout-pro/
+│
+├── src/
+│   ├── frontend/                  
+│   │   ├── components/
+│   │   │   ├── Auth/              
+│   │   │   ├── Dashboard/         
+│   │   │   ├── Analysis/          
+│   │   │   └── Common/            
+│   │   ├── pages/
+│   │   │   ├── index.js           
+│   │   │   ├── dashboard.js       
+│   │   │   ├── about.js           
+│   │   │   └── _app.js            
+│   │   ├── utils/
+│   │   │   ├── api.js             # API calls
+│   │   │   ├── auth.js            # Auth helpers
+│   │   │   └── constants.js       # Free quotas, enterprise settings
+│   │   └── styles/
+│   │       └── globals.css
+│
+├── src/backend/                   
+│   ├── api/
+│   │   ├── analyze.js             # AI analysis via OpenRouter free-tier
+│   │   └── authMiddleware.js      # Auth verification (Firebase/Clerk)
+│   ├── utils/
+│   │   ├── db.js                  # Firestore connection
+│   │   ├── validateInput.js       # Contract input validation
+│   │   └── usageTracker.js        # Track per-user free quotas
+│
+├── public/                        
+├── .env.local                      # API keys for Firebase + OpenRouter
+├── package.json
+└── vercel.json                     # Vercel routing + functions config
+const fetch = require("node-fetch");
+const { db } = require("../utils/db");
+const usageTracker = require("../utils/usageTracker");
+const validateInput = require("../utils/validateInput");
+const authMiddleware = require("./authMiddleware");
+
+module.exports = async function handler(req, res) {
+  await authMiddleware(req, res, async () => {
+    try {
+      const { text } = req.body;
+      validateInput(text);
+
+      await usageTracker(req.user, db); // tracks free-tier quota
+
+      const payload = {
+        model: "mistralai/mistral-7b-instruct", // Free-tier OpenRouter model
+        messages: [
+          { role: "system", content: "You are a Legal Analysis assistant. Return ## Summary, ## Risks, ## Suggestions." },
+          { role: "user", content: text }
+        ]
+      };
+
+      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) throw new Error("Free AI API failed");
+      const data = await response.json();
+      const generatedText = data.choices?.[0]?.message?.content;
+
+      if (!generatedText) throw new Error("Empty response from AI");
+
+      await db.collection("users").doc(req.user.uid)
+        .collection("analyses").add({
+          text,
+          analysis: generatedText,
+          timestamp: Date.now()
+        });
+
+      res.json({ analysis: generatedText });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Analysis failed" });
+    }
+  });
+};
